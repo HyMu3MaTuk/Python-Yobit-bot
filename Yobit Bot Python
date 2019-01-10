@@ -1,0 +1,574 @@
+#!/usr/bin/python
+import os
+import json
+import requests
+import urllib, http.client
+import hmac, hashlib
+import time
+import re
+
+# Вписываем свои ключи
+API_KEY = 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' 
+API_SECRET = b'xxxxxxxx361ee6f063b14432d6583d9a'
+
+"""
+    Каждый новый запрос к серверу должен содержать увеличенное число в диапазоне 1-2147483646
+    Поэтому храним число в файле поблизости, каждый раз обновляя его
+"""
+nonce_file = "./nonce"
+if not os.path.exists(nonce_file):
+    with open(nonce_file, "w") as out:
+        out.write('1')
+
+# Будем перехватывать все сообщения об ошибках с биржи
+class YobitException(Exception):
+    pass
+        
+def call_api(**kwargs):
+
+    # При каждом обращении к торговому API увеличиваем счетчик nonce на единицу
+    with open(nonce_file, 'r+') as inp:
+        nonce = int(inp.read())
+        inp.seek(0)
+        inp.write(str(nonce+1))
+        inp.truncate()
+
+    payload = {'nonce': nonce}
+
+    if kwargs:
+        payload.update(kwargs)
+    payload =  urllib.parse.urlencode(payload)
+
+    H = hmac.new(key=API_SECRET, digestmod=hashlib.sha512)
+    H.update(payload.encode('utf-8'))
+    sign = H.hexdigest()
+    
+    headers = {"Content-type": "application/x-www-form-urlencoded",
+           "Key":API_KEY,
+           "Sign":sign}
+    conn = http.client.HTTPSConnection("yobit.net", timeout=120)
+    conn.request("POST", "/tapi/", payload, headers)
+    response = conn.getresponse().read()
+    
+    conn.close()
+
+    try:
+        time.sleep(1)
+        obj = json.loads(response.decode('utf-8'))
+        if 'error' in obj and obj['error']:
+            raise YobitException(obj['error'])
+        return obj
+    except json.decoder.JSONDecodeError:
+        raise YobitException('Ошибка анализа возвращаемых данных, получена строка', response)
+
+DEBUG = True
+FEE = 0.2
+PROFIT = 1.3
+USD = 0.5
+BTC = 0.0002
+B = 3
+S = 5
+BAL = 0.2
+BAL_BTC = 0.00011
+X = 2.5
+
+
+while(True):
+    print('YOBOT v.0.01 beta')
+    print('Время', time.asctime())
+    print ('Закрываем открытые ордера', '*'*30)
+
+# Получаем список активных ордеров
+    pairs = ['skull_usd']
+    for p in pairs:
+        print(p)
+    opened_orders = []     #список с открытыми ордерами
+    for m in range(len(pairs)):
+        try:
+            time.sleep(1)
+            yobit_orders = call_api(method="ActiveOrders", pair = pairs[m])['return']
+            for order in yobit_orders: 
+                o = yobit_orders[order]
+                o['order_id']=order
+                opened_orders.append(o)     #добавление в список открытых ордеров
+        except KeyError:
+            if DEBUG:
+                print('Открытых ордеров нет', pairs[m])
+
+    PIDs = opened_orders
+    print(PIDs)
+
+    '''
+    print ('Получаем информацию по ордерам', '*'*30)
+    orderinfo = {}
+    for i in range(len(PIDs)):
+        op_orders = (PIDs[i]['order_id'])
+        try: 
+            ordinfo = call_api(method="OrderInfo", order_id=op_orders)
+            print(ordinfo['return'])
+        except YobitException as e:
+            if DEBUG:
+                print("Облом: Не получили INFO по ордерам", e)
+    print(orderinfo)
+    '''
+    
+    
+    
+    for i in range(len(PIDs)):
+        op_orders = (PIDs[i]['order_id'])
+        print (op_orders, '=>>')
+        try:
+            call_api(method="CancelOrder", order_id = op_orders)
+        #except YobitException as e:
+        #    print("Облом:", e)
+        except KeyError:
+            if DEBUG:
+                print('Облом')
+            
+    
+           
+    print ('Получаем глубину стакана', '*'*30)
+
+    
+    depth = {}
+    for d in range(len(pairs)):
+        try:
+            time.sleep(1)
+            depth_ = json.loads(requests.get("https://yobit.net/api/3/depth/"+pairs[d]).text)
+            d_b = round(depth_[pairs[d]]['bids'][0][0], 8)
+            d_s = round(depth_[pairs[d]]['asks'][0][0], 8)
+            v = round((d_b*0.025), 8)            # ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+            f = round((FEE/100*d_s*2*PROFIT), 8) # Комиссия с учетом PROFIT
+            s = round(d_s - d_b, 8)              # спред
+            proc = round((s/d_b)*100, 8)         # спред в процентах
+            val_b = round(USD/d_b, 8)            # кол-во монет можно купить за USD
+            val_s = round(USD/d_s, 8)            # кол-во монет можно продать за USD
+            depth[pairs[d]] = {'rate_buy':d_b, 'rate_sell':d_s, 'step_2.5%':v, 'komsa':f, 'spred':s, 'spred_%':proc, 'val_buy':val_b, 'val_sell':val_s}
+            
+            
+        except KeyError:
+            if DEBUG:
+                print('Облом')
+
+    print (depth)
+            
+
+    time.sleep(1)
+    depth_god_usd = json.loads(requests.get("https://yobit.net/api/3/depth/god_usd").text)           
+    d_b_god_usd = round(depth_god_usd['god_usd']['bids'][0][0], 8)  # верхняя цена стакана покупки
+    d_s_god_usd = round(depth_god_usd['god_usd']['asks'][0][0], 8)  # нижняя цена стакана продажи
+    print ('макс. цена покупки GOD_USD', d_b_god_usd)
+    print ('мини. цена продажи GOD_USD', d_s_god_usd)
+    v_god_usd = round((d_b_god_usd*0.025), 8)            # ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+    f_god_usd = round((FEE/100*d_s_god_usd*2*PROFIT), 8) # Комиссия с учетом PROFIT
+    s_god_usd = round(d_s_god_usd - d_b_god_usd, 8)      # спред
+    proc_god_usd = round((s_god_usd/d_b_god_usd)*100, 8) # спред в процентах
+    val_b_god_usd = round(USD/d_b_god_usd, 8)            # кол-во монет можно купить за USD
+    val_s_god_usd = round(USD/d_s_god_usd, 8)            # кол-во монет можно продать за USD
+    time.sleep(1)
+    
+    depth_bcd_usd = json.loads(requests.get("https://yobit.net/api/3/depth/bcd_usd").text)               
+    d_b_bcd_usd = round(depth_bcd_usd['bcd_usd']['bids'][0][0], 8)
+    d_s_bcd_usd = round(depth_bcd_usd['bcd_usd']['asks'][0][0], 8)
+    print ('макс. цена покупки BCD_USD', d_b_bcd_usd)
+    print ('мини. цена продажи BCD_USD', d_s_bcd_usd)
+    v_bcd_usd = round((d_b_bcd_usd*0.025), 8) #ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+    f_bcd_usd = round((FEE/100*d_s_bcd_usd*2*PROFIT), 8)
+    s_bcd_usd = round(d_s_bcd_usd - d_b_bcd_usd, 8)
+    proc_bcd_usd = round((s_bcd_usd/d_b_bcd_usd)*100, 8)
+    val_b_bcd_usd = round(USD/d_b_bcd_usd, 8)
+    val_s_bcd_usd = round(USD/d_s_bcd_usd, 8)
+    time.sleep(1) 
+    
+    depth_pwr_usd = json.loads(requests.get("https://yobit.net/api/3/depth/pwr_usd").text)               
+    d_b_pwr_usd = round(depth_pwr_usd['pwr_usd']['bids'][0][0], 8)
+    d_s_pwr_usd = round(depth_pwr_usd['pwr_usd']['asks'][0][0], 8)
+    print ('макс. цена покупки PWR_USD', d_b_pwr_usd)
+    print ('мини. цена продажи PWR_USD', d_s_pwr_usd)
+    v_pwr_usd = round((d_b_pwr_usd*0.025), 8) #ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+    f_pwr_usd = round((FEE/100*d_s_pwr_usd*2*PROFIT), 8)
+    s_pwr_usd = round(d_s_pwr_usd - d_b_pwr_usd, 8)
+    proc_pwr_usd = round((s_pwr_usd/d_b_pwr_usd)*100, 8)
+    val_b_pwr_usd = round(USD/d_b_pwr_usd, 8)
+    print ('PWR NEED', val_b_pwr_usd)
+    val_s_pwr_usd = round(USD/d_s_pwr_usd, 8)
+    time.sleep(1)
+
+    depth_lcc_usd = json.loads(requests.get("https://yobit.net/api/3/depth/lcc_usd").text)               
+    d_b_lcc_usd = round(depth_lcc_usd['lcc_usd']['bids'][0][0], 8)
+    d_s_lcc_usd = round(depth_lcc_usd['lcc_usd']['asks'][0][0], 8)
+    print ('макс. цена покупки LCC_USD', d_b_lcc_usd)
+    print ('мини. цена продажи LCC_USD', d_s_lcc_usd)
+    v_lcc_usd = round((d_b_lcc_usd*0.025), 8) #ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+    f_lcc_usd = round((FEE/100*d_s_lcc_usd*2*PROFIT), 8)
+    s_lcc_usd = round(d_s_lcc_usd - d_b_lcc_usd, 8)
+    proc_lcc_usd = round((s_lcc_usd/d_b_lcc_usd)*100, 8)
+    val_b_lcc_usd = round(USD/d_b_lcc_usd, 8)
+    val_s_lcc_usd = round(USD/d_s_lcc_usd, 8)
+    time.sleep(1)
+
+    depth_eth_usd = json.loads(requests.get("https://yobit.net/api/3/depth/eth_usd").text)               
+    d_b_eth_usd = round(depth_eth_usd['eth_usd']['bids'][0][0], 8)
+    d_s_eth_usd = round(depth_eth_usd['eth_usd']['asks'][0][0], 8)
+    print ('макс. цена покупки ETH_USD', d_b_eth_usd)
+    print ('мини. цена продажи ETH_USD', d_s_eth_usd)
+    v_eth_usd = round((d_b_eth_usd*0.025), 8) #ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+    f_eth_usd = round((FEE/100*d_s_eth_usd*2*PROFIT), 8)
+    s_eth_usd = round(d_s_eth_usd - d_b_eth_usd, 8)
+    proc_eth_usd = round((s_eth_usd/d_b_eth_usd)*100, 8)
+    val_b_eth_usd = round(USD/d_b_eth_usd, 8)
+    val_s_eth_usd = round(USD/d_s_eth_usd, 8)
+    time.sleep(1)
+
+    depth_btc_usd = json.loads(requests.get("https://yobit.net/api/3/depth/btc_usd").text)               
+    d_b_btc_usd = round(depth_btc_usd['btc_usd']['bids'][0][0], 8)
+    d_s_btc_usd = round(depth_btc_usd['btc_usd']['asks'][0][0], 8)
+    print ('макс. цена покупки BTC_USD', d_b_btc_usd)
+    print ('мини. цена продажи BTC_USD', d_s_btc_usd)
+    v_btc_usd = round((d_b_btc_usd*0.025), 8) #ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+    f_btc_usd = round((FEE/100*d_s_btc_usd*2*PROFIT), 8) 
+    s_btc_usd = round(d_s_btc_usd - d_b_btc_usd, 8)
+    proc_btc_usd = round((s_btc_usd/d_b_btc_usd)*100, 8)
+    val_b_btc_usd = round(USD/d_b_btc_usd, 8)
+    val_s_btc_usd = round(USD/d_s_btc_usd, 8)
+    time.sleep(1)
+
+    depth_skull_usd = json.loads(requests.get("https://yobit.net/api/3/depth/skull_usd").text)                
+    d_b_skull_usd = round(depth_skull_usd['skull_usd']['bids'][0][0], 8)
+    d_s_skull_usd = round(depth_skull_usd['skull_usd']['asks'][0][0], 8)
+    print ('макс. цена покупки SKULL_USD', d_b_skull_usd)
+    print ('мини. цена продажи SKULL_USD', d_s_skull_usd)
+    v_skull_usd = round((d_b_skull_usd*0.025), 8) #ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+    f_skull_usd = round((FEE/100*d_s_skull_usd*2*PROFIT), 8)
+    s_skull_usd = round(d_s_skull_usd - d_b_skull_usd, 8)
+    proc_skull_usd = round((s_skull_usd/d_b_skull_usd)*100, 8)
+    val_b_skull_usd = round(USD/d_b_skull_usd, 8)
+    val_s_skull_usd = round(USD/d_s_skull_usd, 8)
+    time.sleep(1)
+
+    depth_skull_btc = json.loads(requests.get("https://yobit.net/api/3/depth/skull_btc").text)                
+    d_b_skull_btc = round(depth_skull_btc['skull_btc']['bids'][0][0], 8)
+    d_s_skull_btc = round(depth_skull_btc['skull_btc']['asks'][0][0], 8)
+    print ('макс. цена покупки SKULL_BTC', d_b_skull_btc)
+    print ('мини. цена продажи SKULL_BTC', d_s_skull_btc)
+    v_skull_btc = round((d_b_skull_btc*0.025), 8) #ШАГ В СТАКАНЕ 2,5% ОТ ЦЕНЫ ПОКУПКИ
+    f_skull_btc = round((FEE/100*d_s_skull_btc*2*PROFIT), 8)
+    s_skull_btc = round(d_s_skull_btc - d_b_skull_btc, 8)
+    proc_skull_btc = round((s_skull_btc/d_b_skull_btc)*100, 8)
+    val_b_skull_btc = round(BTC/d_b_skull_btc, 8)
+    val_s_skull_btc = round(BTC/d_s_skull_btc, 8)
+
+    print ('Cпред GOD/USD =>>', proc_god_usd,'%', 'ИЛИ', s_god_usd)
+    print ('Cпред SKULL/USD =>>', proc_skull_usd,'%', 'ИЛИ', s_skull_usd)
+    print ('Cпред SKULL/BTC =>>', proc_skull_btc,'%', 'ИЛИ', s_skull_btc)
+    
+    print ('Комиссия GOD/USD =>>', f_god_usd)
+    print ('Комиссия SKULL/USD =>>', f_skull_usd)
+    print ('Комиссия SKULL/BTC =>>', f_skull_btc)
+    
+    print ('Получаем инфо по аккаунту', '*'*30)
+    
+#    print(call_api(method="getInfo"))
+    bal = call_api(method="getInfo")
+    time.sleep(1)
+    bal_usd = bal['return']['funds']['usd']
+    bal_rur = bal['return']['funds']['rur']
+    bal_btc = bal['return']['funds']['btc']
+    bal_eth = bal['return']['funds']['eth']
+    bal_lcc = bal['return']['funds']['lcc']
+    bal_doge = bal['return']['funds']['doge']
+    
+    bal_waves = bal['return']['funds']['waves']
+    bal_god = bal['return']['funds']['god']
+    bal_trx = bal['return']['funds']['trx']
+    bal_bcd = bal['return']['funds']['bcd']
+    bal_pwr = bal['return']['funds']['pwr']
+    bal_skull = bal['return']['funds']['skull']
+
+    bal_btc_usd = round(bal_btc*d_b_btc_usd, 8)
+    bal_eth_usd = round(bal_eth*d_b_eth_usd, 8)
+    bal_god_usd = round(bal_god*d_b_god_usd, 8)
+    bal_skull_usd = round(bal_skull*d_b_skull_usd, 8)
+    bal_bcd_usd = round(bal_bcd*d_b_bcd_usd, 8)
+    bal_lcc_usd = round(bal_lcc*d_b_lcc_usd, 8)
+    bal_pwr_usd = round(bal_pwr*d_b_pwr_usd, 8)
+    bal_skull_btc = round(bal_skull*d_b_skull_btc, 8)
+    
+    
+    
+    print("БАЛАНС USD =>>", bal_usd)
+    print("БАЛАНС RUR =>>", bal_rur)
+    print("БАЛАНС BTC =>>", bal_btc)
+    print("БАЛАНС ETH =>>", bal_eth)
+    print("БАЛАНС DOGE =>>", bal_doge)
+    print("БАЛАНС WAVES =>>", bal_waves)
+    print("БАЛАНС GOD =>>", bal_god)
+    print("БАЛАНС TRX =>>", bal_trx)
+    print("БАЛАНС LCC =>>", bal_lcc)
+    print("БАЛАНС BCD =>>", bal_bcd)
+    print("БАЛАНС PWR =>>", bal_pwr)
+    print("БАЛАНС SKULL =>>", bal_skull, 'USD ИЛИ', bal_skull_btc, 'BTC')
+
+    
+   
+    print ('Создаем ордер на покупку', '*'*30) 
+    
+    try:
+        time.sleep(1)
+        if (bal_usd >= B*USD and s_god_usd >= f_god_usd ):
+            call_api(method="Trade", pair="god_usd", type="buy", rate=d_b_god_usd+0.00000001, amount=val_b_god_usd), print('ХОРОШИЙ СПРЕД, ПОКУПАЮ', val_s_god_usd, 'GOD ПО ЦЕНЕ', d_b_god_usd+0.00000001, 'USD')
+        elif (bal_usd >= B*USD and s_god_usd >= f_god_usd and proc_god_usd >= X):
+            call_api(method="Trade", pair="god_usd", type="buy", rate=d_b_god_usd+0.00000001, amount=val_b_god_usd), print('ХОРОШИЙ %, ПОКУПАЮ', val_s_god_usd, 'GOD ПО ЦЕНЕ', d_b_god_usd+0.00000001, 'USD')
+        elif (bal_usd >= B*USD):
+            call_api(method="Trade", pair="god_usd", type="buy", rate=d_b_god_usd-f_god_usd, amount=val_b_god_usd), print('ПОКУПАЮ', val_s_god_usd, 'GOD ПО ЦЕНЕ', d_b_god_usd-f_god_usd, 'USD')
+            
+    except YobitException as e:
+        print("Облом: BUY GOD_USD", e)
+
+    try:
+        time.sleep(1)
+        if (bal_usd >= B*USD and s_bcd_usd >= f_bcd_usd):
+            call_api(method="Trade", pair="bcd_usd", type="buy", rate=d_b_bcd_usd+0.00000001, amount=val_b_bcd_usd)
+        elif (bal_usd >= B*USD and proc_bcd_usd >= X):
+            call_api(method="Trade", pair="bcd_usd", type="buy", rate=d_b_bcd_usd+0.00000001, amount=val_b_bcd_usd)
+        elif (bal_usd >= B*USD):
+            call_api(method="Trade", pair="bcd_usd", type="buy", rate=d_b_bcd_usd-f_bcd_usd, amount=val_b_bcd_usd)
+            
+    except YobitException as e:
+        print("Облом: BUY BCD_USD", e)
+    '''
+    try:
+        if (bal_usd >= B*USD and s_lcc_usd >= f_lcc_usd):
+            call_api(method="Trade", pair="lcc_usd", type="buy", rate=d_b_lcc_usd+0.00000001, amount=val_b_lcc_usd)
+        elif (bal_usd >= B*USD and proc_lcc_usd >= X):
+            call_api(method="Trade", pair="lcc_usd", type="buy", rate=d_b_lcc_usd+0.00000001, amount=val_b_lcc_usd)
+        elif (bal_usd >= B*USD):
+            call_api(method="Trade", pair="lcc_usd", type="buy", rate=d_b_lcc_usd-f_lcc_usd, amount=val_b_lcc_usd)
+            
+    except YobitException as e:
+        print("Облом: BUY LCC_USD", e)
+    '''
+
+    try:
+        time.sleep(1)
+        if (bal_usd >= B*USD and s_pwr_usd >= f_pwr_usd):
+            call_api(method="Trade", pair="pwr_usd", type="buy", rate=d_b_pwr_usd+0.00000001, amount=val_b_pwr_usd)
+        elif (bal_usd >= B*USD and proc_pwr_usd >= X):
+            call_api(method="Trade", pair="pwr_usd", type="buy", rate=d_b_pwr_usd+0.00000001, amount=val_b_pwr_usd)
+        elif (bal_usd >= B*USD):
+            call_api(method="Trade", pair="pwr_usd", type="buy", rate=d_b_pwr_usd-f_pwr_usd, amount=val_b_pwr_usd)
+            
+    except YobitException as e:
+        print("Облом: BUY PWR_USD", e)
+        
+    '''
+    try:
+        if (bal_usd >= B*USD and s_btc_usd >= f_btc_usd):
+            call_api(method="Trade", pair="btc_usd", type="buy", rate=d_b_btc_usd+0.00000001, amount=val_b_btc_usd), print('ХОРОШИЙ СПРЕД, ПОКУПАЮ', val_s_btc_usd, 'BTC ПО ЦЕНЕ', d_b_btc_usd+0.00000001, 'USD')
+        elif (bal_usd >= B*USD and proc_btc_usd >= X):
+            call_api(method="Trade", pair="btc_usd", type="buy", rate=d_b_btc_usd+0.00000001, amount=val_b_btc_usd), print('ХОРОШИЙ %, ПОКУПАЮ', val_s_btc_usd, 'BTC ПО ЦЕНЕ', d_b_btc_usd+0.00000001, 'USD')
+        elif (bal_usd >= B*USD):
+            call_api(method="Trade", pair="btc_usd", type="buy", rate=d_b_btc_usd-f_btc_usd, amount=val_b_btc_usd), print('ПОКУПАЮ', val_s_btc_usd, 'BTC ПО ЦЕНЕ', d_b_btc_usd-f_btc_usd, 'USD')
+            
+    except YobitException as e:
+        print("Облом: BUY BTC_USD", e)
+
+    try:
+        if (bal_btc >= B*BTC and s_skull_btc >= f_skull_btc and BAL_BTC >= bal_skull_btc):
+            call_api(method="Trade", pair="skull_btc", type="buy", rate=d_b_skull_btc+0.00000001, amount=val_b_skull_btc), print('ХОРОШИЙ СПРЕД, ПОКУПАЮ', val_s_btc_usd, 'SKULL ПО ЦЕНЕ', d_b_btc_usd+0.00000001, 'BTC')
+        elif (bal_btc >= B*BTC and bal_skull_btc < 2*BAL_BTC and proc_skull_btc >= X):
+            call_api(method="Trade", pair="skull_btc", type="buy", rate=d_b_skull_btc+0.00000001, amount=val_b_skull_btc), print('ХОРОШИЙ %, ПОКУПАЮ', val_s_skull_btc, 'SKULL ПО ЦЕНЕ', d_b_skull_btc+0.00000001, 'BTC')
+        elif (bal_btc >= B*BTC and BAL_BTC >= bal_skull_btc):
+            call_api(method="Trade", pair="skull_btc", type="buy", rate=d_b_skull_btc-f_skull_btc, amount=val_b_skull_btc), print('ПОКУПАЮ', val_s_skull_btc, 'SKULL ПО ЦЕНЕ', d_b_skull_btc-f_skull_btc, 'BTC')
+            
+    except YobitException as e:
+        print("Облом: BUY SKULL_BTC", e)
+    '''
+       
+
+    
+
+    print ('Создаем ордер на продажу', '*'*30)
+    
+    try:
+        time.sleep(1)
+        if (bal_usd <= S*USD and s_god_usd >= f_god_usd and BAL <= bal_god_usd):
+            call_api(method="Trade", pair="god_usd", type="sell", rate=d_s_god_usd - 0.00000001, amount = val_s_god_usd), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_god_usd, 'GOD ПО ЦЕНЕ', d_s_god_usd-0.00000001, 'USD')
+        elif (s_god_usd >= f_god_usd and proc_god_usd >= X and BAL <= bal_god_usd):
+            call_api(method="Trade", pair="god_usd", type="sell", rate=d_s_god_usd - 0.00000001, amount = val_s_god_usd), print('ХОРОШИЙ %, ПРОДАЮ', val_s_god_usd, 'GOD ПО ЦЕНЕ', d_s_god_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and BAL <= bal_god_usd):
+            call_api(method="Trade", pair="god_usd", type="sell", rate=d_s_god_usd + f_god_usd, amount = val_s_god_usd), print('ПРОДАЮ', val_s_god_usd, 'GOD ПО ЦЕНЕ', d_s_god_usd+f_god_usd, 'USD')
+        
+    except YobitException as e:
+        print("Облом: SELL GOD_USD", e)
+
+    
+    try:
+        time.sleep(1)
+        if (bal_usd <= S*USD and s_bcd_usd >= f_bcd_usd and BAL <= bal_bcd_usd):
+            call_api(method="Trade", pair="bcd_usd", type="sell", rate=d_s_bcd_usd - 0.00000001, amount = val_s_bcd_usd), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_bcd_usd, 'BCD ПО ЦЕНЕ', d_s_bcd_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and s_bcd_usd >= f_bcd_usd and proc_bcd_usd >= X and BAL <= bal_bcd_usd):
+            call_api(method="Trade", pair="bcd_usd", type="sell", rate=d_s_bcd_usd - 0.00000001, amount = val_s_bcd_usd), print('ХОРОШИЙ %, ПРОДАЮ', val_s_bcd_usd, 'BCD ПО ЦЕНЕ', d_s_bcd_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and BAL <= bal_bcd_usd):
+            call_api(method="Trade", pair="bcd_usd", type="sell", rate=d_s_bcd_usd + f_bcd_usd, amount = val_s_bcd_usd), print('ПРОДАЮ', val_s_bcd_usd, 'BCD ПО ЦЕНЕ', d_s_bcd_usd+f_bcd_usd, 'USD')
+        
+    except YobitException as e:
+        print("Облом: SELL BCD_USD", e)
+
+    '''
+    try:
+        if (bal_usd <= S*USD and s_lcc_usd >= f_lcc_usd and BAL <= bal_lcc_usd):
+            call_api(method="Trade", pair="lcc_usd", type="sell", rate=d_s_lcc_usd - 0.00000001, amount = val_s_lcc_usd), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_lcc_usd, 'LCC ПО ЦЕНЕ', d_s_lcc_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and s_lcc_usd >= f_lcc_usd and proc_lcc_usd >= X and BAL <= bal_lcc_usd):
+            call_api(method="Trade", pair="lcc_usd", type="sell", rate=d_s_lcc_usd - 0.00000001, amount = val_s_lcc_usd), print('ХОРОШИЙ %, ПРОДАЮ', val_s_lcc_usd, 'LCC ПО ЦЕНЕ', d_s_lcc_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and BAL <= bal_lcc_usd):
+            call_api(method="Trade", pair="lcc_usd", type="sell", rate=d_s_lcc_usd + f_lcc_usd, amount = val_s_lcc_usd), print('ПРОДАЮ', val_s_lcc_usd, 'LCC ПО ЦЕНЕ', d_s_lcc_usd+f_lcc_usd, 'USD')
+        
+    except YobitException as e:
+        print("Облом: SELL LCC_USD", e)
+
+    '''
+    try:
+        time.sleep(1)
+        if (bal_usd <= S*USD and s_skull_usd >= f_skull_usd and BAL <= bal_skull_usd):
+            call_api(method="Trade", pair="skull_usd", type="sell", rate=d_s_skull_usd - 0.00000001, amount = val_s_skull_usd), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_skull_usd, 'SKULL ПО ЦЕНЕ', d_s_skull_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and s_skull_usd >= f_skull_usd and bal_skull_usd >= BAL and proc_skull_usd >= X):
+            call_api(method="Trade", pair="skull_usd", type="sell", rate=d_s_skull_usd - 0.00000001, amount = val_s_skull_usd), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_skull_usd, 'SKULL ПО ЦЕНЕ', d_s_skull_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and BAL <= bal_skull_usd):
+            call_api(method="Trade", pair="skull_usd", type="sell", rate=d_s_skull_usd + f_skull_usd, amount = val_s_skull_usd), print('ПРОДАЮ', val_s_skull_usd, 'SKULL ПО ЦЕНЕ', d_s_skull_usd+f_skull_usd, 'USD')
+        else: print('ДОСТАТОЧНО БАКСОВ ИЛИ МАЛО SKULL')
+    except YobitException as e:
+        print("Облом: SELL SKULL_USD", e)
+
+
+    try:
+        time.sleep(1)
+        if (bal_usd <= S*USD and s_pwr_usd >= f_pwr_usd and BAL <= bal_pwr_usd):
+            call_api(method="Trade", pair="pwr_usd", type="sell", rate=d_s_pwr_usd - 0.00000001, amount = val_s_pwr_usd), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_pwr_usd, 'PWR ПО ЦЕНЕ', d_s_pwr_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and s_pwr_usd >= f_lcc_usd and proc_lcc_usd >= X and BAL <= bal_pwr_usd):
+            call_api(method="Trade", pair="pwr_usd", type="sell", rate=d_s_pwr_usd - 0.00000001, amount = val_s_pwr_usd), print('ХОРОШИЙ %, ПРОДАЮ', val_s_pwr_usd, 'PWR ПО ЦЕНЕ', d_s_pwr_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and BAL <= bal_pwr_usd):
+            call_api(method="Trade", pair="pwr_usd", type="sell", rate=d_s_pwr_usd + f_pwr_usd, amount = val_s_pwr_usd), print('ПРОДАЮ', val_s_pwr_usd, 'PWR ПО ЦЕНЕ', d_s_pwr_usd+f_pwr_usd, 'USD')
+        
+    except YobitException as e:
+        print("Облом: SELL PWR_USD", e) 
+
+    '''
+    try:
+        if (bal_usd <= S*USD and s_btc_usd >= f_btc_usd and BAL <= bal_btc_usd):
+            call_api(method="Trade", pair="btc_usd", type="sell", rate=d_s_btc_usd - 0.00000001, amount = val_s_btc_usd), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_btc_usd, 'BTC ПО ЦЕНЕ', d_s_btc_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and s_btc_usd >= f_btc_usd and bal_btc_usd >= BAL and proc_btc_usd >= X):
+            call_api(method="Trade", pair="btc_usd", type="sell", rate=d_s_btc_usd - 0.00000001, amount = val_s_btc_usd), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_btc_usd, 'BTC ПО ЦЕНЕ', d_s_btc_usd-0.00000001, 'USD')
+        elif (bal_usd <= S*USD and BAL <= bal_btc_usd):
+            call_api(method="Trade", pair="bcd_usd", type="sell", rate=d_s_bcd_usd + f_bcd_usd, amount = val_s_bcd_usd), print('ПРОДАЮ', val_s_bcd_usd, 'BCD ПО ЦЕНЕ', d_s_bcd_usd+f_bcd_usd, 'USD')
+        else: print('ДОСТАТОЧНО БАКСОВ ИЛИ МАЛО BTC')
+    except YobitException as e:
+        print("Облом: SELL BTC_USD", e)
+
+
+
+    try:
+        if (bal_usd <= S*USD and s_skull_btc >= f_skull_btc and BAL_BTC <= bal_skull_btc):
+            call_api(method="Trade", pair="skull_btc", type="sell", rate=d_s_skull_btc - 0.00000001, amount = val_s_skull_btc), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_skull_btc, 'SKULL ПО ЦЕНЕ', d_s_skull_btc-0.00000001, 'BTC')
+        elif (bal_usd <= S*USD and s_skull_btc >= f_skull_btc and bal_skull_btc >= BAL_BTC and proc_skull_btc >= X):
+            call_api(method="Trade", pair="skull_btc", type="sell", rate=d_s_skull_btc - 0.00000001, amount = val_s_skull_btc), print('ХОРОШИЙ СПРЕД, ПРОДАЮ', val_s_skull_btc, 'SKULL ПО ЦЕНЕ', d_s_skull_btc-0.00000001, 'BTC')
+        elif (bal_usd <= S*USD and BAL_BTC <= bal_skull_btc):
+            call_api(method="Trade", pair="skull_btc", type="sell", rate=d_s_skull_btc + f_skull_btc, amount = val_s_skull_btc), print('ПРОДАЮ', val_s_skull_btc, 'SKULL ПО ЦЕНЕ', d_s_skull_btc+f_skull_btc, 'BTC')
+        else: print('ДОСТАТОЧНО BTC ИЛИ МАЛО SKULL')
+    except YobitException as e:
+        print("Облом: SELL SKULL_BTC", e)
+    '''
+       
+     
+    
+#    order = []
+#    sell_orders = []
+#    for order in sell_orders:
+#        order_status = call_api(method="OrderInfo", order_id=order['order_id'])['return'][str(order['order_id'])]['status']
+       
+    
+    
+    
+    
+
+#try:
+#    print ('Создаем ордер на покупку', '*'*30)
+#    print( call_api(method="Trade", pair="ltc_btc", type="buy", rate="0.1", amount=0.01) )
+#except YobitException as e:
+#    print("Облом:", e)
+
+#try:
+#    print ('Создаем ордер на продажу', '*'*30)
+#    print( call_api(method="Trade", pair="ltc_btc", type="sell", rate="0.1", amount=0.01) )
+#except YobitException as e:
+#    print("Облом:", e)
+
+#    try:
+#        print ('Получаем список активных ордеров', '*'*30)
+#        print(call_api(method="ActiveOrders", pair="god_usd"))
+#    except YobitException as e:
+#        print("Облом:", e)
+
+
+#try:
+#    print ('Получаем информацию по ордеру', '*'*30)
+#    print( call_api(method="OrderInfo", order_id="123") )
+#except YobitException as e:
+#    print("Облом:", e)
+
+#try:
+#    print ('Отменяем ордер', '*'*30)
+#    print( call_api(method="CancelOrder", order_id="123") )
+#except YobitException as e:
+#    print("Облом:", e)
+#{'200002148': {'pair': 'god_usd', 'type': 'buy', 'amount': 0.02234375, 'rate': 15.83333357, 'order_id': '106437460608034', 'is_your_order': 1, 'timestamp': '1518816209'}
+    
+    '''    
+    print ('Получаем историю торгов', '*'*30)
+    History = {}
+    for m in range(len(pairs)):
+        try:
+            hist = call_api(method="TradeHistory", pair=pairs[m])['return']
+            #print (hist)
+            for HIDs in hist:
+                History[pairs[m]] = hist[HIDs]
+            
+    
+                    
+                    #try:
+            
+                    #except YobitException as e:
+                    #    print("Облом:", e)
+                    
+             
+             
+       
+        except KeyError:
+            if DEBUG:
+                print('Истории торгов нет', pairs[m])
+    #print (History)
+    '''
+    '''
+    for pair, value in TradeHistory.items():
+        print("Пара", pair)
+        print("Тип", value['sell', 'Не указано'], value['buy'])
+        print("Стаканы:")
+        print("Цена", value['rate'])
+        print("Кол-во", value['amount'])
+        print(menu.keys())
+    '''
+
+    ''' 
+        try:
+            for item in value['sell']:
+                print("Готовы продать {amount:0.8f} по курсу {rate:0.8f}".format(
+                    amount=float(item[1]), rate=float(item[0])
+                ))
+        except YobitException as e:
+            print("Облом:", e)
+    '''
+
+
+
+
+    time.sleep(120)
